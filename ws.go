@@ -176,7 +176,8 @@ func serveWs(hub *Hub, db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	var user User
 	var roleStr string
 	var avatarURL sql.NullString
-	err = db.QueryRow("SELECT id, username, role, avatar_url FROM users WHERE id = ?", userID).Scan(&user.ID, &user.Username, &roleStr, &avatarURL)
+	// FIXED: Use $1 instead of ?
+	err = db.QueryRow("SELECT id, username, role, avatar_url FROM users WHERE id = $1", userID).Scan(&user.ID, &user.Username, &roleStr, &avatarURL)
 	if err != nil {
 		http.Error(w, "User not found", http.StatusNotFound)
 		return

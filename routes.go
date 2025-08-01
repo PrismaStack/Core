@@ -96,7 +96,7 @@ func getCategoriesHandler(db *sql.DB) http.HandlerFunc {
 				continue
 			}
 
-			chRows, err := db.Query("SELECT id, name, category_id, position FROM channels WHERE category_id = ? ORDER BY position", cat.ID)
+			chRows, err := db.Query("SELECT id, name, category_id, position FROM channels WHERE category_id = $1 ORDER BY position", cat.ID)
 			if err != nil {
 				log.Printf("DB Error getting channels for category %d: %v", cat.ID, err)
 				continue
@@ -130,7 +130,7 @@ func createCategoryHandler(db *sql.DB) http.HandlerFunc {
 		}
 		var maxPosition sql.NullInt64
 		db.QueryRow("SELECT MAX(position) FROM channel_categories").Scan(&maxPosition)
-		stmt, _ := db.Prepare("INSERT INTO channel_categories(name, position) VALUES(?, ?)")
+		stmt, _ := db.Prepare("INSERT INTO channel_categories(name, position) VALUES($1, $2)")
 		res, err := stmt.Exec(newCategory.Name, maxPosition.Int64+1)
 		if err != nil {
 			http.Error(w, "Failed to create category", http.StatusInternalServerError)
@@ -154,8 +154,8 @@ func createChannelHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 		var maxPosition sql.NullInt64
-		db.QueryRow("SELECT MAX(position) FROM channels WHERE category_id = ?", newChannel.CategoryID).Scan(&maxPosition)
-		stmt, _ := db.Prepare("INSERT INTO channels(name, category_id, position) VALUES(?, ?, ?)")
+		db.QueryRow("SELECT MAX(position) FROM channels WHERE category_id = $1", newChannel.CategoryID).Scan(&maxPosition)
+		stmt, _ := db.Prepare("INSERT INTO channels(name, category_id, position) VALUES($1, $2, $3)")
 		res, err := stmt.Exec(newChannel.Name, newChannel.CategoryID, maxPosition.Int64+1)
 		if err != nil {
 			http.Error(w, "Failed to create channel", http.StatusInternalServerError)
@@ -190,7 +190,7 @@ func updateChannelHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		_, err = db.Exec("UPDATE channels SET name = ? WHERE id = ?", newName, channelID)
+		_, err = db.Exec("UPDATE channels SET name = $1 WHERE id = $2", newName, channelID)
 		if err != nil {
 			log.Printf("DB Error updating channel: %v", err)
 			http.Error(w, "Failed to update channel", http.StatusInternalServerError)
@@ -209,7 +209,7 @@ func deleteChannelHandler(db *sql.DB) http.HandlerFunc {
 			http.Error(w, "Invalid channel ID", http.StatusBadRequest)
 			return
 		}
-		_, err = db.Exec("DELETE FROM channels WHERE id = ?", channelID)
+		_, err = db.Exec("DELETE FROM channels WHERE id = $1", channelID)
 		if err != nil {
 			log.Printf("DB Error deleting channel: %v", err)
 			http.Error(w, "Failed to delete channel", http.StatusInternalServerError)
@@ -226,7 +226,7 @@ func getMessagesHandler(db *sql.DB) http.HandlerFunc {
 		rows, err := db.Query(`
             SELECT m.id, m.channel_id, m.user_id, u.username, m.content, m.created_at, u.avatar_url
             FROM messages m JOIN users u ON m.user_id = u.id
-            WHERE m.channel_id = ? ORDER BY m.created_at DESC`, channelID)
+            WHERE m.channel_id = $1 ORDER BY m.created_at DESC`, channelID)
 		if err != nil {
 			http.Error(w, "Database error", http.StatusInternalServerError)
 			return
@@ -258,14 +258,15 @@ func createMessageHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 		}
 
 		tx, _ := db.Begin()
-		stmt, _ := tx.Prepare("INSERT INTO messages(channel_id, user_id, content) VALUES(?, ?, ?)")
-		res, err := stmt.Exec(req.ChannelID, req.UserID, req.Content)
+		stmt, _ := tx.Prepare("INSERT INTO messages(channel_id, user_id, content) VALUES($1, $2, $3) RETURNING id")
+		var id int64
+		err := stmt.QueryRow(req.ChannelID, req.UserID, req.Content).Scan(&id)
+		stmt.Close()
 		if err != nil {
 			tx.Rollback()
 			http.Error(w, "Failed to send message", http.StatusInternalServerError)
 			return
 		}
-		id, _ := res.LastInsertId()
 		tx.Commit()
 
 		var msg Message
@@ -273,7 +274,7 @@ func createMessageHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 		row := db.QueryRow(`
             SELECT m.id, m.channel_id, m.user_id, u.username, m.content, m.created_at, u.avatar_url
             FROM messages m JOIN users u ON m.user_id = u.id
-            WHERE m.id = ?`, id)
+            WHERE m.id = $1`, id)
 		if err := row.Scan(&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Username, &msg.Content, &msg.CreatedAt, &avatarURL); err != nil {
 			log.Printf("Could not retrieve message for broadcast: %v", err)
 		} else {
@@ -296,7 +297,7 @@ func reorderHandler(db *sql.DB, tableName string) http.HandlerFunc {
 		var items []ReorderItem
 		json.NewDecoder(r.Body).Decode(&items)
 		tx, _ := db.Begin()
-		stmt, _ := tx.Prepare(fmt.Sprintf("UPDATE %s SET position = ? WHERE id = ?", tableName))
+		stmt, _ := tx.Prepare(fmt.Sprintf("UPDATE %s SET position = $1 WHERE id = $2", tableName))
 		defer stmt.Close()
 		for _, item := range items {
 			if _, err := stmt.Exec(item.Position, item.ID); err != nil {
@@ -351,7 +352,7 @@ func uploadAvatarHandler(db *sql.DB) http.HandlerFunc {
 			log.Printf("Failed to create thumbnail: %v", err)
 		}
 		avatarURL := fmt.Sprintf("/uploads/%s", filename)
-		_, err = db.Exec("UPDATE users SET avatar_url = ? WHERE id = ?", avatarURL, userID)
+		_, err = db.Exec("UPDATE users SET avatar_url = $1 WHERE id = $2", avatarURL, userID)
 		if err != nil {
 			http.Error(w, "Failed to update user", http.StatusInternalServerError)
 			return

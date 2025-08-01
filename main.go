@@ -5,10 +5,8 @@ import (
 	"net/http"
 
 	"github.com/gorilla/mux"
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/lib/pq"
 )
-
-const dbFile = "prisma.db"
 
 func main() {
 	db := initDB()
@@ -30,6 +28,6 @@ func main() {
 	// Catch-all: Serve Flutter web build from the "web" folder for any other route
 	r.PathPrefix("/").Handler(serveWebApp())
 
-	log.Println("Server started at :8080")
-	log.Fatal(http.ListenAndServe(":8080", r))
+	log.Println("Server started at :8081")
+	log.Fatal(http.ListenAndServe(":8081", r))
 }
