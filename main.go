@@ -22,7 +22,7 @@ func main() {
 	r := mux.NewRouter()
 	registerRoutes(r, db, hub)
 
-	// Serve uploads (avatars etc) before the web handler
+	// Serve uploads (avatars, files, etc) before the web handler
 	r.PathPrefix("/uploads/").Handler(http.StripPrefix("/uploads/", http.FileServer(http.Dir("uploads"))))
 
 	// Catch-all: Serve Flutter web build from the "web" folder for any other route

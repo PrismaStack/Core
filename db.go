@@ -25,12 +25,10 @@ func postgresDSN() string {
 }
 
 func initDB() *sql.DB {
-	// No need to create a file for PostgreSQL; just connect.
 	db, err := sql.Open("postgres", postgresDSN())
 	if err != nil {
 		log.Fatalf("Failed to open db: %v", err)
 	}
-	// Check if the connection works
 	if err := db.Ping(); err != nil {
 		log.Fatalf("Failed to connect to PostgreSQL: %v", err)
 	}
@@ -56,7 +54,15 @@ func ensureTables(db *sql.DB) {
         user_id INTEGER NOT NULL REFERENCES users(id),
         content TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     )`)
-	// No addColumnIfNotExists: ALTER TABLE ... ADD COLUMN IF NOT EXISTS is supported in Postgres 9.6+.
+	db.Exec(`CREATE TABLE IF NOT EXISTS uploads (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        orig_filename TEXT NOT NULL,
+        stored_filename TEXT NOT NULL,
+        filetype TEXT,
+        filesize INTEGER,
+        uploaded_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    )`)
 	db.Exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT`)
 	db.Exec(`ALTER TABLE channel_categories ADD COLUMN IF NOT EXISTS position INTEGER NOT NULL DEFAULT 0`)
 	db.Exec(`ALTER TABLE channels ADD COLUMN IF NOT EXISTS position INTEGER NOT NULL DEFAULT 0`)

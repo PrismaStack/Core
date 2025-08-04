@@ -55,3 +55,14 @@ type ReorderItem struct {
 	ID       int64 `json:"id"`
 	Position int   `json:"position"`
 }
+
+// Upload struct for file uploads
+type Upload struct {
+	ID            int64     `json:"id"`
+	UserID        int64     `json:"user_id"`
+	OrigFilename  string    `json:"orig_filename"`
+	StoredFilename string   `json:"stored_filename"`
+	Filetype      string    `json:"filetype"`
+	Filesize      int64     `json:"filesize"`
+	UploadedAt    time.Time `json:"uploaded_at"`
+}

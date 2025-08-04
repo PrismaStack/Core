@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gorilla/mux"
 )
@@ -30,6 +31,7 @@ func registerRoutes(r *mux.Router, db *sql.DB, hub *Hub) {
 	r.HandleFunc("/api/reorder/categories", reorderHandler(db, "channel_categories")).Methods("POST")
 	r.HandleFunc("/api/reorder/channels", reorderHandler(db, "channels")).Methods("POST")
 	r.HandleFunc("/api/upload-avatar", uploadAvatarHandler(db)).Methods("POST")
+	r.HandleFunc("/api/upload-file", uploadFileHandler(db)).Methods("POST") // <-- NEW ENDPOINT
 	r.PathPrefix("/uploads/").Handler(http.StripPrefix("/uploads/", http.FileServer(http.Dir("uploads"))))
 	r.HandleFunc("/api/ws", func(w http.ResponseWriter, r *http.Request) {
 		serveWs(hub, db, w, r)
@@ -359,5 +361,83 @@ func uploadAvatarHandler(db *sql.DB) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"avatar_url": avatarURL})
+	}
+}
+
+// --- NEW: File upload handler ---
+func uploadFileHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		const maxUploadSize = 100 << 20 // 100MB
+		err := r.ParseMultipartForm(maxUploadSize)
+		if err != nil {
+			http.Error(w, "Failed to parse form", http.StatusBadRequest)
+			return
+		}
+		userIDStr := r.FormValue("user_id")
+		if userIDStr == "" {
+			http.Error(w, "User ID required", http.StatusBadRequest)
+			return
+		}
+		userID, err := strconv.ParseInt(userIDStr, 10, 64)
+		if err != nil || userID < 1 {
+			http.Error(w, "Invalid User ID", http.StatusBadRequest)
+			return
+		}
+		file, handler, err := r.FormFile("file")
+		if err != nil {
+			http.Error(w, "Error retrieving file", http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+
+		if err := os.MkdirAll("uploads", os.ModePerm); err != nil {
+			http.Error(w, "Failed to create upload directory", http.StatusInternalServerError)
+			return
+		}
+
+		// Create a unique filename to avoid collisions
+		timestamp := time.Now().UnixNano()
+		ext := filepath.Ext(handler.Filename)
+		storedFilename := fmt.Sprintf("file_%d_%d%s", userID, timestamp, ext)
+		filePath := filepath.Join("uploads", storedFilename)
+
+		dst, err := os.Create(filePath)
+		if err != nil {
+			http.Error(w, "Failed to create file", http.StatusInternalServerError)
+			return
+		}
+		defer dst.Close()
+
+		n, err := io.Copy(dst, file)
+		if err != nil {
+			http.Error(w, "Failed to save file", http.StatusInternalServerError)
+			return
+		}
+
+		// Optional: get content type (not always reliable)
+		filetype := handler.Header.Get("Content-Type")
+
+		// Insert upload metadata into DB
+		var uploadID int64
+		err = db.QueryRow(
+			`INSERT INTO uploads (user_id, orig_filename, stored_filename, filetype, filesize) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+			userID, handler.Filename, storedFilename, filetype, n,
+		).Scan(&uploadID)
+		if err != nil {
+			http.Error(w, "Failed to record upload", http.StatusInternalServerError)
+			return
+		}
+
+		uploadURL := fmt.Sprintf("/uploads/%s", storedFilename)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"id":              uploadID,
+			"orig_filename":   handler.Filename,
+			"stored_filename": storedFilename,
+			"filetype":        filetype,
+			"filesize":        n,
+			"url":             uploadURL,
+		})
 	}
 }
