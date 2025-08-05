@@ -66,3 +66,10 @@ type Upload struct {
 	Filesize      int64     `json:"filesize"`
 	UploadedAt    time.Time `json:"uploaded_at"`
 }
+
+type Session struct {
+	Token     string    `json:"token"`
+	UserID    int64     `json:"user_id"`
+	CreatedAt time.Time `json:"created_at"`
+	ExpiresAt time.Time `json:"expires_at"`
+}

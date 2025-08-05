@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -19,23 +20,37 @@ import (
 
 // Registers all HTTP routes and handlers
 func registerRoutes(r *mux.Router, db *sql.DB, hub *Hub) {
+	// Public routes
 	r.HandleFunc("/api/login", loginHandler(db)).Methods("POST")
 	r.HandleFunc("/api/register", registerHandler(db)).Methods("POST")
-	r.HandleFunc("/api/categories", getCategoriesHandler(db)).Methods("GET")
-	r.HandleFunc("/api/categories", createCategoryHandler(db)).Methods("POST")
-	r.HandleFunc("/api/channels/{id:[0-9]+}", updateChannelHandler(db)).Methods("PUT")
-	r.HandleFunc("/api/channels/{id:[0-9]+}", deleteChannelHandler(db)).Methods("DELETE")
-	r.HandleFunc("/api/channels", createChannelHandler(db)).Methods("POST")
-	r.HandleFunc("/api/channels/{id:[0-9]+}/messages", getMessagesHandler(db)).Methods("GET")
-	r.HandleFunc("/api/messages", createMessageHandler(db, hub)).Methods("POST")
-	r.HandleFunc("/api/reorder/categories", reorderHandler(db, "channel_categories")).Methods("POST")
-	r.HandleFunc("/api/reorder/channels", reorderHandler(db, "channels")).Methods("POST")
-	r.HandleFunc("/api/upload-avatar", uploadAvatarHandler(db)).Methods("POST")
-	r.HandleFunc("/api/upload-file", uploadFileHandler(db)).Methods("POST") // <-- NEW ENDPOINT
-	r.PathPrefix("/uploads/").Handler(http.StripPrefix("/uploads/", http.FileServer(http.Dir("uploads"))))
+
+	// Authenticated API routes
+	api := r.PathPrefix("/api").Subrouter()
+	api.Use(requireToken(db)) // Apply middleware to all /api routes after this point
+
+	api.HandleFunc("/categories", getCategoriesHandler(db)).Methods("GET")
+	api.HandleFunc("/categories", createCategoryHandler(db)).Methods("POST")
+
+	api.HandleFunc("/channels/{id:[0-9]+}", updateChannelHandler(db)).Methods("PUT")
+	api.HandleFunc("/channels/{id:[0-9]+}", deleteChannelHandler(db)).Methods("DELETE")
+	api.HandleFunc("/channels", createChannelHandler(db)).Methods("POST")
+	api.HandleFunc("/channels/{id:[0-9]+}/messages", getMessagesHandler(db)).Methods("GET")
+
+	api.HandleFunc("/messages", createMessageHandler(db, hub)).Methods("POST")
+
+	api.HandleFunc("/reorder/categories", reorderHandler(db, "channel_categories")).Methods("POST")
+	api.HandleFunc("/reorder/channels", reorderHandler(db, "channels")).Methods("POST")
+
+	api.HandleFunc("/upload-avatar", uploadAvatarHandler(db)).Methods("POST")
+	api.HandleFunc("/upload-file", uploadFileHandler(db)).Methods("POST")
+
+	// WebSocket route (handled separately, auth is inside serveWs)
 	r.HandleFunc("/api/ws", func(w http.ResponseWriter, r *http.Request) {
 		serveWs(hub, db, w, r)
 	})
+
+	// Static file serving
+	r.PathPrefix("/uploads/").Handler(http.StripPrefix("/uploads/", http.FileServer(http.Dir("uploads"))))
 }
 
 // --- Handler functions ---
@@ -53,8 +68,24 @@ func loginHandler(db *sql.DB) http.HandlerFunc {
 			http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 			return
 		}
+
+		token, err := createSession(db, user.ID)
+		if err != nil {
+			log.Printf("Failed to create session for '%s': %v", creds.Username, err)
+			http.Error(w, "Failed to create session", http.StatusInternalServerError)
+			return
+		}
+
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(user)
+		// FIX: Return a flat JSON object for easier client-side parsing.
+		// It includes all user fields plus the token.
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"id":         user.ID,
+			"username":   user.Username,
+			"role":       user.Role,
+			"avatar_url": user.AvatarURL,
+			"token":      token,
+		})
 	}
 }
 
@@ -252,12 +283,26 @@ func getMessagesHandler(db *sql.DB) http.HandlerFunc {
 
 func createMessageHandler(db *sql.DB, hub *Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// FIX: User is now reliably retrieved from the context.
+		user := userFromContext(r.Context())
+		if user == nil {
+			http.Error(w, "Authentication error: User not found in context", http.StatusUnauthorized)
+			return
+		}
+
 		var req NewMessageRequest
-		json.NewDecoder(r.Body).Decode(&req)
-		if req.Content == "" || req.ChannelID == 0 || req.UserID == 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		if req.Content == "" || req.ChannelID == 0 {
 			http.Error(w, "Missing fields", http.StatusBadRequest)
 			return
 		}
+
+		// Set the UserID from the authenticated user context
+		req.UserID = user.ID
 
 		tx, _ := db.Begin()
 		stmt, _ := tx.Prepare("INSERT INTO messages(channel_id, user_id, content) VALUES($1, $2, $3) RETURNING id")
@@ -320,9 +365,9 @@ func uploadAvatarHandler(db *sql.DB) http.HandlerFunc {
 			http.Error(w, "Failed to parse form", http.StatusBadRequest)
 			return
 		}
-		userID := r.FormValue("user_id")
-		if userID == "" {
-			http.Error(w, "User ID required", http.StatusBadRequest)
+		user := userFromContext(r.Context())
+		if user == nil {
+			http.Error(w, "User not found", http.StatusUnauthorized)
 			return
 		}
 		file, handler, err := r.FormFile("avatar")
@@ -336,7 +381,7 @@ func uploadAvatarHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 		ext := filepath.Ext(handler.Filename)
-		filename := fmt.Sprintf("avatar_%s%s", userID, ext)
+		filename := fmt.Sprintf("avatar_%d%s", user.ID, ext)
 		filePath := filepath.Join("uploads", filename)
 		dst, err := os.Create(filePath)
 		if err != nil {
@@ -348,13 +393,13 @@ func uploadAvatarHandler(db *sql.DB) http.HandlerFunc {
 			http.Error(w, "Failed to save file", http.StatusInternalServerError)
 			return
 		}
-		thumbPath := filepath.Join("uploads", fmt.Sprintf("thumb_%s%s", userID, ext))
+		thumbPath := filepath.Join("uploads", fmt.Sprintf("thumb_%d%s", user.ID, ext))
 		cmd := exec.Command("convert", filePath, "-resize", "100x100", thumbPath)
 		if err := cmd.Run(); err != nil {
 			log.Printf("Failed to create thumbnail: %v", err)
 		}
 		avatarURL := fmt.Sprintf("/uploads/%s", filename)
-		_, err = db.Exec("UPDATE users SET avatar_url = $1 WHERE id = $2", avatarURL, userID)
+		_, err = db.Exec("UPDATE users SET avatar_url = $1 WHERE id = $2", avatarURL, user.ID)
 		if err != nil {
 			http.Error(w, "Failed to update user", http.StatusInternalServerError)
 			return
@@ -364,7 +409,7 @@ func uploadAvatarHandler(db *sql.DB) http.HandlerFunc {
 	}
 }
 
-// --- NEW: File upload handler ---
+// --- File upload handler ---
 func uploadFileHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		const maxUploadSize = 100 << 20 // 100MB
@@ -373,14 +418,9 @@ func uploadFileHandler(db *sql.DB) http.HandlerFunc {
 			http.Error(w, "Failed to parse form", http.StatusBadRequest)
 			return
 		}
-		userIDStr := r.FormValue("user_id")
-		if userIDStr == "" {
-			http.Error(w, "User ID required", http.StatusBadRequest)
-			return
-		}
-		userID, err := strconv.ParseInt(userIDStr, 10, 64)
-		if err != nil || userID < 1 {
-			http.Error(w, "Invalid User ID", http.StatusBadRequest)
+		user := userFromContext(r.Context())
+		if user == nil {
+			http.Error(w, "User not found", http.StatusUnauthorized)
 			return
 		}
 		file, handler, err := r.FormFile("file")
@@ -395,10 +435,9 @@ func uploadFileHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		// Create a unique filename to avoid collisions
 		timestamp := time.Now().UnixNano()
 		ext := filepath.Ext(handler.Filename)
-		storedFilename := fmt.Sprintf("file_%d_%d%s", userID, timestamp, ext)
+		storedFilename := fmt.Sprintf("file_%d_%d%s", user.ID, timestamp, ext)
 		filePath := filepath.Join("uploads", storedFilename)
 
 		dst, err := os.Create(filePath)
@@ -414,14 +453,12 @@ func uploadFileHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		// Optional: get content type (not always reliable)
 		filetype := handler.Header.Get("Content-Type")
 
-		// Insert upload metadata into DB
 		var uploadID int64
 		err = db.QueryRow(
 			`INSERT INTO uploads (user_id, orig_filename, stored_filename, filetype, filesize) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-			userID, handler.Filename, storedFilename, filetype, n,
+			user.ID, handler.Filename, storedFilename, filetype, n,
 		).Scan(&uploadID)
 		if err != nil {
 			http.Error(w, "Failed to record upload", http.StatusInternalServerError)
@@ -438,6 +475,46 @@ func uploadFileHandler(db *sql.DB) http.HandlerFunc {
 			"filetype":        filetype,
 			"filesize":        n,
 			"url":             uploadURL,
+		})
+	}
+}
+
+// --- Token/session middleware ---
+
+type contextKey string
+
+const userContextKey = contextKey("user")
+
+func userFromContext(ctx context.Context) *User {
+	user, _ := ctx.Value(userContextKey).(*User)
+	return user
+}
+
+// requireToken is middleware that checks for a valid bearer token.
+func requireToken(db *sql.DB) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" {
+				http.Error(w, "Missing token", http.StatusUnauthorized)
+				return
+			}
+
+			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+			if tokenStr == authHeader { // No "Bearer " prefix found
+				http.Error(w, "Invalid token format", http.StatusUnauthorized)
+				return
+			}
+
+			user, ok := getUserByToken(db, tokenStr)
+			if !ok {
+				http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
+				return
+			}
+
+			refreshSession(db, tokenStr)
+			ctx := context.WithValue(r.Context(), userContextKey, user)
+			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }

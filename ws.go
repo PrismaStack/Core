@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"strconv"
 
 	"github.com/gorilla/websocket"
 )
@@ -164,27 +163,20 @@ func (c *Client) readPump() {
 	}
 }
 
-// THE FIX IS HERE - start writePump and readPump before registering the client.
+// FIX: Authenticate WebSocket connection using the token from query parameter
 func serveWs(hub *Hub, db *sql.DB, w http.ResponseWriter, r *http.Request) {
-	userIDStr := r.URL.Query().Get("user_id")
-	userID, err := strconv.ParseInt(userIDStr, 10, 64)
-	if err != nil {
-		http.Error(w, "Invalid user_id", http.StatusBadRequest)
+	// FIX: Authenticate WebSocket connection using the token from query parameter
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		http.Error(w, "Missing authentication token", http.StatusBadRequest)
 		return
 	}
 
-	var user User
-	var roleStr string
-	var avatarURL sql.NullString
-	// FIXED: Use $1 instead of ?
-	err = db.QueryRow("SELECT id, username, role, avatar_url FROM users WHERE id = $1", userID).Scan(&user.ID, &user.Username, &roleStr, &avatarURL)
-	if err != nil {
-		http.Error(w, "User not found", http.StatusNotFound)
+	// FIX: Get the user via the token, not an insecure user_id
+	user, ok := getUserByToken(db, token)
+	if !ok {
+		http.Error(w, "Invalid authentication token", http.StatusUnauthorized)
 		return
-	}
-	user.Role = Role(roleStr)
-	if avatarURL.Valid {
-		user.AvatarURL = avatarURL.String
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -193,14 +185,11 @@ func serveWs(hub *Hub, db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := &Client{hub: hub, conn: conn, send: make(chan []byte, 256), user: user}
+	client := &Client{hub: hub, conn: conn, send: make(chan []byte, 256), user: *user}
+	client.hub.register <- client
 
-	// Start the writer and reader goroutines BEFORE registering the client.
-	// This prevents a deadlock where the hub tries to send a message to a
-	// client that isn't ready to receive it yet.
+	// Allow collection of memory referenced by the caller by doing all work in
+	// new goroutines.
 	go client.writePump()
 	go client.readPump()
-
-	// Now it's safe to register the client.
-	client.hub.register <- client
 }

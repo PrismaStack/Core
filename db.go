@@ -1,10 +1,13 @@
 package main
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	_ "github.com/lib/pq"
 )
@@ -39,6 +42,12 @@ func ensureTables(db *sql.DB) {
 	db.Exec(`CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY, username TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL, role TEXT NOT NULL, avatar_url TEXT
+    )`)
+	db.Exec(`CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMPTZ
     )`)
 	db.Exec(`CREATE TABLE IF NOT EXISTS channel_categories (
         id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL,
@@ -141,4 +150,54 @@ func checkUser(db *sql.DB, username, password string) (*User, bool) {
 		u.AvatarURL = ""
 	}
 	return &u, true
+}
+
+// Token/session logic
+
+func generateToken() (string, error) {
+	b := make([]byte, 32)
+	_, err := rand.Read(b)
+	if err != nil {
+		return "", err
+	}
+	return base64.URLEncoding.EncodeToString(b), nil
+}
+
+func createSession(db *sql.DB, userID int64) (string, error) {
+	token, err := generateToken()
+	if err != nil {
+		return "", err
+	}
+	expires := time.Now().Add(30 * 24 * time.Hour)
+	_, err = db.Exec(`INSERT INTO sessions (token, user_id, expires_at) VALUES ($1, $2, $3)`, token, userID, expires)
+	if err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func getUserByToken(db *sql.DB, token string) (*User, bool) {
+	row := db.QueryRow(`
+		SELECT u.id, u.username, u.role, u.avatar_url
+		FROM sessions s
+		JOIN users u ON s.user_id = u.id
+		WHERE s.token = $1 AND (s.expires_at IS NULL OR s.expires_at > NOW())`, token)
+	var u User
+	var roleStr string
+	var avatarURL sql.NullString
+	err := row.Scan(&u.ID, &u.Username, &roleStr, &avatarURL)
+	if err != nil {
+		return nil, false
+	}
+	u.Role = Role(roleStr)
+	if avatarURL.Valid {
+		u.AvatarURL = avatarURL.String
+	} else {
+		u.AvatarURL = ""
+	}
+	return &u, true
+}
+
+func refreshSession(db *sql.DB, token string) {
+	db.Exec(`UPDATE sessions SET expires_at=$1 WHERE token=$2`, time.Now().Add(30*24*time.Hour), token)
 }
